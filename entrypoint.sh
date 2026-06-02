@@ -55,7 +55,6 @@ init_defaults() {
   WG_ALLOWED_IPS="${WG_ALLOWED_IPS:-0.0.0.0/0,::/0}"
   WG_PEER_ALLOWED_IPS="${WG_PEER_ALLOWED_IPS:-${WG_CLIENT_IP}/32}"
   WG_ENDPOINT="${WG_ENDPOINT:-}"
-  WG_BACKEND="${WG_BACKEND:-xray}"
   WG_INTERFACE="${WG_INTERFACE:-wg0}"
 
   TPROXY_PORT="${TPROXY_PORT:-12345}"
@@ -176,19 +175,6 @@ validate_vless_config() {
   log_info "VLESS config validated: ${VLESS_HOST}:${VLESS_PORT} (security: ${VLESS_SECURITY})"
 }
 
-validate_backend_config() {
-  case "$WG_BACKEND" in
-    xray|kernel) ;;
-    *) die "WG_BACKEND must be either 'xray' or 'kernel'" ;;
-  esac
-
-  if [[ "$WG_BACKEND" == "kernel" && "$WG_ALLOWED_IPS" == *"::"* ]]; then
-    log_warn "Kernel backend currently configures IPv4 transparent proxying only; IPv6 routes in WG_ALLOWED_IPS may not be proxied."
-  fi
-
-  log_info "WireGuard backend selected: ${WG_BACKEND}"
-}
-
 # ============ Config Generation ============
 
 build_stream_settings() {
@@ -237,11 +223,6 @@ build_stream_settings() {
 
 generate_xray_config() {
   log_info "Generating Xray configuration..."
-  local template_name="xray.json.tmpl"
-
-  if [[ "$WG_BACKEND" == "kernel" ]]; then
-    template_name="xray-kernel.json.tmpl"
-  fi
 
   # Build computed values and export for envsubst
   export STREAM_SETTINGS="$(build_stream_settings)"
@@ -259,7 +240,7 @@ generate_xray_config() {
   export VLESS_HOST VLESS_PORT VLESS_UUID VLESS_FLOW VLESS_PACKET_ENCODING
   export TPROXY_PORT
 
-  envsubst < "${TEMPLATE_DIR}/${template_name}" > "$XRAY_CONFIG"
+  envsubst < "${TEMPLATE_DIR}/xray.json.tmpl" > "$XRAY_CONFIG"
 
   log_info "Xray config written to ${XRAY_CONFIG}"
 }
@@ -349,6 +330,7 @@ setup_kernel_backend() {
 
   iptables -t nat -N WG2VLESS
   if [[ "$KERNEL_DNS_BYPASS" == "1" ]]; then
+    log_info "DNS bypass is enabled; DNS requests from WireGuard clients will leave the container directly."
     iptables -t nat -A WG2VLESS -p tcp --dport 53 -j RETURN
     iptables -t nat -A WG2VLESS -p udp --dport 53 -j RETURN
     iptables -t nat -A POSTROUTING -o eth0 -p tcp --dport 53 -j MASQUERADE
@@ -387,7 +369,10 @@ main() {
   # Parse and validate VLESS config
   parse_vless_config
   validate_vless_config
-  validate_backend_config
+
+  if [[ "$WG_ALLOWED_IPS" == *"::"* ]]; then
+    log_warn "Kernel WireGuard backend currently configures IPv4 transparent proxying only; IPv6 routes in WG_ALLOWED_IPS may not be proxied."
+  fi
 
   # Generate configs
   generate_xray_config
@@ -399,9 +384,7 @@ main() {
     exit 0
   fi
 
-  if [[ "$WG_BACKEND" == "kernel" ]]; then
-    setup_kernel_backend
-  fi
+  setup_kernel_backend
 
   # Run Xray
   log_info "Starting Xray..."
