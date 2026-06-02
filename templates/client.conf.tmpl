@@ -2,10 +2,10 @@
 PrivateKey = ${CLIENT_PRIVATE_KEY}
 Address = ${WG_CLIENT_IP}/32
 DNS = ${WG_DNS}
+MTU = ${WG_MTU}
 
 [Peer]
 PublicKey = ${SERVER_PUBLIC_KEY}
 Endpoint = ${WG_ENDPOINT}:${WG_PORT}
 AllowedIPs = ${WG_ALLOWED_IPS}
 PersistentKeepalive = 25
-MTU = ${WG_MTU}
