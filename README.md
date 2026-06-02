@@ -9,6 +9,7 @@ Docker bridge that accepts WireGuard connections and forwards traffic through a 
 - Auto-generates WireGuard keypairs
 - Config via URL or individual variables
 - Multi-arch support (amd64, arm64, armv7)
+- Optional kernel WireGuard backend for high-throughput router scenarios
 
 ## Configuration
 
@@ -37,6 +38,33 @@ docker-compose up -d
 
 Client config is generated at `./data/client.conf` — import it into any WireGuard app.
 
+## Kernel WireGuard backend
+
+By default, wg2vless uses Xray's built-in WireGuard inbound (`WG_BACKEND=xray`).
+For routers or high-throughput clients, you can test the optional kernel backend:
+
+```bash
+docker compose -f docker-compose.kernel-test.yml up -d --build
+```
+
+The kernel backend uses Linux WireGuard inside the container and forwards decrypted
+traffic to Xray with transparent proxying. Run it as a separate test service first:
+use a different container name, UDP port, volume, and tunnel subnet from any
+production deployment.
+
+Required runtime permissions:
+
+```yaml
+cap_add:
+  - NET_ADMIN
+devices:
+  - /dev/net/tun:/dev/net/tun
+```
+
+The example `docker-compose.kernel-test.yml` listens on UDP `51823`, stores keys
+in `./data-kernel-test`, and uses `10.77.77.0/24` so it does not overlap with a
+default production service on UDP `51820`.
+
 ## Environment
 
 #### VLESS
@@ -53,6 +81,7 @@ Client config is generated at `./data/client.conf` — import it into any WireGu
 | `VLESS_SID` | `aabbcc` | REALITY short ID |
 | `VLESS_FP` | `chrome` | Browser fingerprint |
 | `VLESS_FLOW` | `xtls-rprx-vision` | Flow control |
+| `VLESS_PACKET_ENCODING` | `xudp` | UDP packet encoding for VLESS outbound |
 | `VLESS_TRANSPORT` | `tcp` | Transport type |
 
 #### WireGuard
@@ -66,6 +95,12 @@ Client config is generated at `./data/client.conf` — import it into any WireGu
 | `WG_MTU` | `1420` | MTU size |
 | `WG_DNS` | `1.1.1.1,8.8.8.8` | DNS servers |
 | `WG_ALLOWED_IPS` | `0.0.0.0/0,::/0` | Client routing |
+| `WG_PEER_ALLOWED_IPS` | `10.66.66.2/32` | Server-side peer allowed IPs; add routed LAN subnets here if your router does not NAT tunnel clients |
+| `WG_BACKEND` | `xray` | WireGuard backend: `xray` or `kernel` |
+| `WG_INTERFACE` | `wg0` | Interface name for `kernel` backend |
+| `TPROXY_PORT` | `12345` | Local transparent redirect port for `kernel` backend |
+| `TPROXY_EXCLUDE_CIDRS` | `10.0.0.0/8,...` | Comma-separated destinations bypassed by transparent redirect |
+| `KERNEL_DNS_BYPASS` | `1` | Send DNS directly from the container instead of proxying it through VLESS; disable it if your VLESS server supports proxied DNS reliably |
 
 #### Other
 
@@ -73,6 +108,7 @@ Client config is generated at `./data/client.conf` — import it into any WireGu
 |----------|---------|-------------|
 | `XRAY_LOGLEVEL` | `warning` | `debug`, `info`, `warning`, `error` |
 | `DATA_DIR` | `/data` | Keys storage path |
+| `WG2VLESS_DRY_RUN` | `1` | Generate and validate config, then exit before runtime setup |
 
 
 ## License

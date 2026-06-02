@@ -30,6 +30,11 @@ need_cmd() {
   command -v "$1" >/dev/null 2>&1 || die "Missing required command: $1"
 }
 
+need_kernel_cmds() {
+  need_cmd ip
+  need_cmd iptables
+}
+
 urldecode() {
   printf '%b' "${1//%/\\x}"
 }
@@ -48,7 +53,15 @@ init_defaults() {
   WG_MTU="${WG_MTU:-1420}"
   WG_DNS="${WG_DNS:-1.1.1.1,8.8.8.8}"
   WG_ALLOWED_IPS="${WG_ALLOWED_IPS:-0.0.0.0/0,::/0}"
+  WG_PEER_ALLOWED_IPS="${WG_PEER_ALLOWED_IPS:-${WG_CLIENT_IP}/32}"
   WG_ENDPOINT="${WG_ENDPOINT:-}"
+  WG_BACKEND="${WG_BACKEND:-xray}"
+  WG_INTERFACE="${WG_INTERFACE:-wg0}"
+
+  TPROXY_PORT="${TPROXY_PORT:-12345}"
+  TPROXY_EXCLUDE_CIDRS="${TPROXY_EXCLUDE_CIDRS:-0.0.0.0/8,10.0.0.0/8,127.0.0.0/8,169.254.0.0/16,172.16.0.0/12,192.168.0.0/16,224.0.0.0/4,240.0.0.0/4,255.255.255.255/32}"
+  KERNEL_DNS_BYPASS="${KERNEL_DNS_BYPASS:-1}"
+  WG2VLESS_DRY_RUN="${WG2VLESS_DRY_RUN:-0}"
 
   XRAY_LOGLEVEL="${XRAY_LOGLEVEL:-warning}"
 
@@ -64,6 +77,7 @@ init_defaults() {
   VLESS_SID="${VLESS_SID:-}"
   VLESS_SPIDERX="${VLESS_SPIDERX:-/}"
   VLESS_TRANSPORT="${VLESS_TRANSPORT:-tcp}"
+  VLESS_PACKET_ENCODING="${VLESS_PACKET_ENCODING:-xudp}"
 
   # Key file paths
   mkdir -p "${DATA_DIR}"
@@ -131,6 +145,7 @@ parse_vless_url() {
       sid) VLESS_SID="$val" ;;
       spiderX|spx) VLESS_SPIDERX="$val" ;;
       type) VLESS_TRANSPORT="$val" ;;
+      packetEncoding|packet_encoding) VLESS_PACKET_ENCODING="$val" ;;
     esac
   done
 
@@ -159,6 +174,19 @@ validate_vless_config() {
   fi
 
   log_info "VLESS config validated: ${VLESS_HOST}:${VLESS_PORT} (security: ${VLESS_SECURITY})"
+}
+
+validate_backend_config() {
+  case "$WG_BACKEND" in
+    xray|kernel) ;;
+    *) die "WG_BACKEND must be either 'xray' or 'kernel'" ;;
+  esac
+
+  if [[ "$WG_BACKEND" == "kernel" && "$WG_ALLOWED_IPS" == *"::"* ]]; then
+    log_warn "Kernel backend currently configures IPv4 transparent proxying only; IPv6 routes in WG_ALLOWED_IPS may not be proxied."
+  fi
+
+  log_info "WireGuard backend selected: ${WG_BACKEND}"
 }
 
 # ============ Config Generation ============
@@ -209,6 +237,11 @@ build_stream_settings() {
 
 generate_xray_config() {
   log_info "Generating Xray configuration..."
+  local template_name="xray.json.tmpl"
+
+  if [[ "$WG_BACKEND" == "kernel" ]]; then
+    template_name="xray-kernel.json.tmpl"
+  fi
 
   # Build computed values and export for envsubst
   export STREAM_SETTINGS="$(build_stream_settings)"
@@ -217,12 +250,16 @@ generate_xray_config() {
   IFS=',' read -ra DNS_ARR <<< "$WG_DNS"
   export DNS_JSON="$(printf '%s\n' "${DNS_ARR[@]}" | jq -R . | jq -s .)"
 
+  IFS=',' read -ra PEER_ALLOWED_IPS_ARR <<< "$WG_PEER_ALLOWED_IPS"
+  export WG_PEER_ALLOWED_IPS_JSON="$(printf '%s\n' "${PEER_ALLOWED_IPS_ARR[@]}" | jq -R 'gsub("^\\s+|\\s+$"; "") | select(length > 0)' | jq -s .)"
+
   # Export all variables needed by template
   export XRAY_LOGLEVEL WG_PORT SERVER_PRIVATE_KEY WG_MTU
-  export CLIENT_PUBLIC_KEY WG_CLIENT_IP
-  export VLESS_HOST VLESS_PORT VLESS_UUID VLESS_FLOW
+  export CLIENT_PUBLIC_KEY WG_CLIENT_IP WG_PEER_ALLOWED_IPS_JSON
+  export VLESS_HOST VLESS_PORT VLESS_UUID VLESS_FLOW VLESS_PACKET_ENCODING
+  export TPROXY_PORT
 
-  envsubst < "${TEMPLATE_DIR}/xray.json.tmpl" > "$XRAY_CONFIG"
+  envsubst < "${TEMPLATE_DIR}/${template_name}" > "$XRAY_CONFIG"
 
   log_info "Xray config written to ${XRAY_CONFIG}"
 }
@@ -258,6 +295,80 @@ generate_wg_client_config() {
   echo ""
 }
 
+# ============ Kernel WireGuard Backend ============
+
+iptables_delete() {
+  iptables "$@" >/dev/null 2>&1 || true
+}
+
+cleanup_kernel_backend() {
+  iptables_delete -t nat -D POSTROUTING -o eth0 -p tcp --dport 53 -j MASQUERADE
+  iptables_delete -t nat -D POSTROUTING -o eth0 -p udp --dport 53 -j MASQUERADE
+
+  iptables_delete -t nat -D PREROUTING -i "$WG_INTERFACE" -p tcp -j WG2VLESS
+  iptables_delete -t nat -D PREROUTING -i "$WG_INTERFACE" -p udp -j WG2VLESS
+  iptables_delete -t nat -F WG2VLESS
+  iptables_delete -t nat -X WG2VLESS
+
+  ip link delete "$WG_INTERFACE" >/dev/null 2>&1 || true
+}
+
+setup_kernel_backend() {
+  log_info "Setting up kernel WireGuard backend on ${WG_INTERFACE}..."
+  need_kernel_cmds
+
+  local peer_allowed_ips wg_prefix
+  peer_allowed_ips="${WG_PEER_ALLOWED_IPS//[[:space:]]/}"
+  wg_prefix="${WG_SUBNET_CIDR#*/}"
+  [[ "$wg_prefix" =~ ^[0-9]+$ ]] || die "WG_SUBNET_CIDR must include a prefix length, for example 10.66.66.0/24"
+
+  cleanup_kernel_backend
+
+  ip link add dev "$WG_INTERFACE" type wireguard
+  ip address add "${WG_SERVER_IP}/${wg_prefix}" dev "$WG_INTERFACE"
+  ip link set mtu "$WG_MTU" up dev "$WG_INTERFACE"
+  wg set "$WG_INTERFACE" \
+    private-key "$SERVER_PRIV" \
+    listen-port "$WG_PORT" \
+    peer "$CLIENT_PUBLIC_KEY" \
+    allowed-ips "$peer_allowed_ips"
+
+  IFS=',' read -ra PEER_ROUTES <<< "$peer_allowed_ips"
+  for cidr in "${PEER_ROUTES[@]}"; do
+    [[ -z "$cidr" ]] && continue
+    if [[ "$cidr" == "0.0.0.0/0" || "$cidr" == "::/0" ]]; then
+      log_warn "Skipping default peer route ${cidr}; it would capture the container's own outbound traffic."
+      continue
+    fi
+    if [[ "$cidr" == *":"* ]]; then
+      log_warn "Skipping IPv6 peer route ${cidr}; kernel backend currently configures IPv4 transparent proxying only."
+      continue
+    fi
+    ip route add "$cidr" dev "$WG_INTERFACE" >/dev/null 2>&1 || true
+  done
+
+  iptables -t nat -N WG2VLESS
+  if [[ "$KERNEL_DNS_BYPASS" == "1" ]]; then
+    iptables -t nat -A WG2VLESS -p tcp --dport 53 -j RETURN
+    iptables -t nat -A WG2VLESS -p udp --dport 53 -j RETURN
+    iptables -t nat -A POSTROUTING -o eth0 -p tcp --dport 53 -j MASQUERADE
+    iptables -t nat -A POSTROUTING -o eth0 -p udp --dport 53 -j MASQUERADE
+  fi
+
+  IFS=',' read -ra EXCLUDES <<< "$TPROXY_EXCLUDE_CIDRS"
+  for cidr in "${EXCLUDES[@]}"; do
+    cidr="${cidr//[[:space:]]/}"
+    [[ -z "$cidr" ]] && continue
+    iptables -t nat -A WG2VLESS -d "$cidr" -j RETURN
+  done
+  iptables -t nat -A WG2VLESS -p tcp -j REDIRECT --to-ports "$TPROXY_PORT"
+  iptables -t nat -A WG2VLESS -p udp -j REDIRECT --to-ports "$TPROXY_PORT"
+  iptables -t nat -A PREROUTING -i "$WG_INTERFACE" -p tcp -j WG2VLESS
+  iptables -t nat -A PREROUTING -i "$WG_INTERFACE" -p udp -j WG2VLESS
+
+  log_info "Kernel WireGuard backend is ready"
+}
+
 # ============ Main ============
 
 main() {
@@ -276,11 +387,21 @@ main() {
   # Parse and validate VLESS config
   parse_vless_config
   validate_vless_config
+  validate_backend_config
 
   # Generate configs
   generate_xray_config
   validate_xray_config
   generate_wg_client_config
+
+  if [[ "$WG2VLESS_DRY_RUN" == "1" ]]; then
+    log_info "WG2VLESS_DRY_RUN=1 set; exiting before runtime setup"
+    exit 0
+  fi
+
+  if [[ "$WG_BACKEND" == "kernel" ]]; then
+    setup_kernel_backend
+  fi
 
   # Run Xray
   log_info "Starting Xray..."

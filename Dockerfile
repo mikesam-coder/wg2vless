@@ -10,6 +10,8 @@ RUN apk add --no-cache \
     gettext \
     openssl \
     ca-certificates \
+    iproute2 \
+    iptables \
     wireguard-tools
 
 RUN ARCH="$(apk --print-arch)" && \
