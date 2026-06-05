@@ -3,23 +3,26 @@
     "loglevel": "${XRAY_LOGLEVEL}",
     "access": "none"
   },
-  "dns": {
-    "servers": ${DNS_JSON}
-  },
   "inbounds": [
     {
-      "tag": "redirect-in",
+      "tag": "tcp-in",
       "protocol": "dokodemo-door",
       "listen": "0.0.0.0",
-      "port": ${TPROXY_PORT},
+      "port": ${REDIRECT_PORT},
       "settings": {
-        "network": "tcp,udp",
+        "network": "tcp",
         "followRedirect": true
-      },
-      "streamSettings": {
-        "sockopt": {
-          "tproxy": "redirect"
-        }
+      }
+    },
+    {
+      "tag": "dns-in",
+      "protocol": "dokodemo-door",
+      "listen": "0.0.0.0",
+      "port": ${DNS_REDIRECT_PORT},
+      "settings": {
+        "address": "${DNS_FIXED}",
+        "port": 53,
+        "network": "tcp,udp"
       }
     }
   ],
@@ -55,7 +58,7 @@
     }
   ],
   "routing": {
-    "domainStrategy": "IPIfNonMatch",
+    "domainStrategy": "AsIs",
     "rules": [
       {
         "type": "field",
@@ -77,7 +80,7 @@
       },
       {
         "type": "field",
-        "inboundTag": ["redirect-in"],
+        "inboundTag": ["tcp-in", "dns-in"],
         "outboundTag": "vless-out"
       }
     ]

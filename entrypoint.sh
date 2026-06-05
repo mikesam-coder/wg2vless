@@ -57,9 +57,16 @@ init_defaults() {
   WG_ENDPOINT="${WG_ENDPOINT:-}"
   WG_INTERFACE="${WG_INTERFACE:-wg0}"
 
-  TPROXY_PORT="${TPROXY_PORT:-12345}"
-  TPROXY_EXCLUDE_CIDRS="${TPROXY_EXCLUDE_CIDRS:-0.0.0.0/8,10.0.0.0/8,127.0.0.0/8,169.254.0.0/16,172.16.0.0/12,192.168.0.0/16,224.0.0.0/4,240.0.0.0/4,255.255.255.255/32}"
-  KERNEL_DNS_BYPASS="${KERNEL_DNS_BYPASS:-1}"
+  REDIRECT_PORT="${REDIRECT_PORT:-12345}"
+  DNS_REDIRECT_PORT="${DNS_REDIRECT_PORT:-12346}"
+  BYPASS_CIDRS="${BYPASS_CIDRS:-0.0.0.0/8,10.0.0.0/8,127.0.0.0/8,169.254.0.0/16,172.16.0.0/12,192.168.0.0/16,224.0.0.0/4,240.0.0.0/4,255.255.255.255/32}"
+  # QUIC/HTTP3 and other UDP cannot be transparently proxied here (nat REDIRECT
+  # loses the original destination for UDP). Rejecting non-DNS UDP makes clients
+  # fall back to TCP instantly instead of hanging on timeouts.
+  REJECT_NON_DNS_UDP="${REJECT_NON_DNS_UDP:-1}"
+  # DNS is proxied through VLESS via a fixed resolver by default (no leak).
+  # Set to 1 to send DNS directly from the container instead (DNS leak).
+  KERNEL_DNS_BYPASS="${KERNEL_DNS_BYPASS:-0}"
   WG2VLESS_DRY_RUN="${WG2VLESS_DRY_RUN:-0}"
 
   XRAY_LOGLEVEL="${XRAY_LOGLEVEL:-warning}"
@@ -227,18 +234,15 @@ generate_xray_config() {
   # Build computed values and export for envsubst
   export STREAM_SETTINGS="$(build_stream_settings)"
 
-  # Build DNS array from comma-separated list
-  IFS=',' read -ra DNS_ARR <<< "$WG_DNS"
-  export DNS_JSON="$(printf '%s\n' "${DNS_ARR[@]}" | jq -R . | jq -s .)"
-
-  IFS=',' read -ra PEER_ALLOWED_IPS_ARR <<< "$WG_PEER_ALLOWED_IPS"
-  export WG_PEER_ALLOWED_IPS_JSON="$(printf '%s\n' "${PEER_ALLOWED_IPS_ARR[@]}" | jq -R 'gsub("^\\s+|\\s+$"; "") | select(length > 0)' | jq -s .)"
+  # Fixed DNS resolver: first entry of WG_DNS. All client DNS is forced here and
+  # proxied through VLESS, so the original destination is not needed for UDP DNS.
+  DNS_FIXED="${WG_DNS%%,*}"
+  DNS_FIXED="${DNS_FIXED//[[:space:]]/}"
+  export DNS_FIXED REDIRECT_PORT DNS_REDIRECT_PORT
 
   # Export all variables needed by template
-  export XRAY_LOGLEVEL WG_PORT SERVER_PRIVATE_KEY WG_MTU
-  export CLIENT_PUBLIC_KEY WG_CLIENT_IP WG_PEER_ALLOWED_IPS_JSON
+  export XRAY_LOGLEVEL
   export VLESS_HOST VLESS_PORT VLESS_UUID VLESS_FLOW VLESS_PACKET_ENCODING
-  export TPROXY_PORT
 
   envsubst < "${TEMPLATE_DIR}/xray.json.tmpl" > "$XRAY_CONFIG"
 
@@ -283,19 +287,32 @@ iptables_delete() {
 }
 
 cleanup_kernel_backend() {
-  iptables_delete -t nat -D POSTROUTING -o eth0 -p tcp --dport 53 -j MASQUERADE
-  iptables_delete -t nat -D POSTROUTING -o eth0 -p udp --dport 53 -j MASQUERADE
-
+  # nat REDIRECT rules
   iptables_delete -t nat -D PREROUTING -i "$WG_INTERFACE" -p tcp -j WG2VLESS
   iptables_delete -t nat -D PREROUTING -i "$WG_INTERFACE" -p udp -j WG2VLESS
   iptables_delete -t nat -F WG2VLESS
   iptables_delete -t nat -X WG2VLESS
+  iptables_delete -t nat -D POSTROUTING -o eth0 -p tcp --dport 53 -j MASQUERADE
+  iptables_delete -t nat -D POSTROUTING -o eth0 -p udp --dport 53 -j MASQUERADE
+
+  # filter REJECT chain for non-DNS UDP
+  iptables_delete -D FORWARD -i "$WG_INTERFACE" -p udp -j WG2VLESS_UDP
+  iptables_delete -F WG2VLESS_UDP
+  iptables_delete -X WG2VLESS_UDP
+
+  # Legacy TPROXY (mangle) artifacts from earlier versions, removed if present
+  iptables_delete -t mangle -D PREROUTING -i "$WG_INTERFACE" -p tcp -j WG2VLESS
+  iptables_delete -t mangle -D PREROUTING -i "$WG_INTERFACE" -p udp -j WG2VLESS
+  iptables_delete -t mangle -F WG2VLESS
+  iptables_delete -t mangle -X WG2VLESS
+  ip rule del fwmark 1 lookup 100 >/dev/null 2>&1 || true
+  ip route flush table 100 >/dev/null 2>&1 || true
 
   ip link delete "$WG_INTERFACE" >/dev/null 2>&1 || true
 }
 
 setup_kernel_backend() {
-  log_info "Setting up kernel WireGuard backend on ${WG_INTERFACE}..."
+  log_info "Setting up kernel WireGuard backend on ${WG_INTERFACE} (REDIRECT mode)..."
   need_kernel_cmds
 
   local peer_allowed_ips wg_prefix
@@ -328,27 +345,53 @@ setup_kernel_backend() {
     ip route add "$cidr" dev "$WG_INTERFACE" >/dev/null 2>&1 || true
   done
 
+  # Transparent proxying via nat REDIRECT. TPROXY would be cleaner but does not
+  # reliably deliver to the proxy socket inside containers, so REDIRECT is used.
+  # TCP keeps its original destination via SO_ORIGINAL_DST. UDP cannot, so DNS is
+  # force-redirected to a fixed resolver and all other UDP (QUIC) is rejected.
   iptables -t nat -N WG2VLESS
+
   if [[ "$KERNEL_DNS_BYPASS" == "1" ]]; then
-    log_info "DNS bypass is enabled; DNS requests from WireGuard clients will leave the container directly."
-    iptables -t nat -A WG2VLESS -p tcp --dport 53 -j RETURN
+    log_warn "KERNEL_DNS_BYPASS=1: DNS leaves the container directly instead of going through VLESS (DNS leak)."
     iptables -t nat -A WG2VLESS -p udp --dport 53 -j RETURN
-    iptables -t nat -A POSTROUTING -o eth0 -p tcp --dport 53 -j MASQUERADE
+    iptables -t nat -A WG2VLESS -p tcp --dport 53 -j RETURN
     iptables -t nat -A POSTROUTING -o eth0 -p udp --dport 53 -j MASQUERADE
+    iptables -t nat -A POSTROUTING -o eth0 -p tcp --dport 53 -j MASQUERADE
   fi
 
-  IFS=',' read -ra EXCLUDES <<< "$TPROXY_EXCLUDE_CIDRS"
+  IFS=',' read -ra EXCLUDES <<< "$BYPASS_CIDRS"
   for cidr in "${EXCLUDES[@]}"; do
     cidr="${cidr//[[:space:]]/}"
     [[ -z "$cidr" ]] && continue
     iptables -t nat -A WG2VLESS -d "$cidr" -j RETURN
   done
-  iptables -t nat -A WG2VLESS -p tcp -j REDIRECT --to-ports "$TPROXY_PORT"
-  iptables -t nat -A WG2VLESS -p udp -j REDIRECT --to-ports "$TPROXY_PORT"
+
+  if [[ "$KERNEL_DNS_BYPASS" != "1" ]]; then
+    iptables -t nat -A WG2VLESS -p udp --dport 53 -j REDIRECT --to-ports "$DNS_REDIRECT_PORT"
+    iptables -t nat -A WG2VLESS -p tcp --dport 53 -j REDIRECT --to-ports "$DNS_REDIRECT_PORT"
+  fi
+
+  iptables -t nat -A WG2VLESS -p tcp -j REDIRECT --to-ports "$REDIRECT_PORT"
+
   iptables -t nat -A PREROUTING -i "$WG_INTERFACE" -p tcp -j WG2VLESS
   iptables -t nat -A PREROUTING -i "$WG_INTERFACE" -p udp -j WG2VLESS
 
-  log_info "Kernel WireGuard backend is ready"
+  # Reject non-DNS UDP (QUIC/HTTP3) so clients fall back to TCP immediately
+  # instead of timing out. DNS UDP is already redirected above and never reaches
+  # FORWARD. Bypassed CIDRs (e.g. LAN) keep working.
+  if [[ "$REJECT_NON_DNS_UDP" == "1" ]]; then
+    iptables -N WG2VLESS_UDP
+    for cidr in "${EXCLUDES[@]}"; do
+      cidr="${cidr//[[:space:]]/}"
+      [[ -z "$cidr" ]] && continue
+      iptables -A WG2VLESS_UDP -d "$cidr" -j RETURN
+    done
+    iptables -A WG2VLESS_UDP -p udp --dport 53 -j RETURN
+    iptables -A WG2VLESS_UDP -p udp -j REJECT --reject-with icmp-port-unreachable
+    iptables -A FORWARD -i "$WG_INTERFACE" -p udp -j WG2VLESS_UDP
+  fi
+
+  log_info "Kernel WireGuard backend is ready (REDIRECT tcp->${REDIRECT_PORT}, dns->${DNS_REDIRECT_PORT}, reject_udp=${REJECT_NON_DNS_UDP})"
 }
 
 # ============ Main ============

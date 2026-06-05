@@ -24,8 +24,13 @@ services:
       WG_ALLOWED_IPS: "0.0.0.0/0,::/0"
       WG_PEER_ALLOWED_IPS: "10.66.66.2/32"
       WG_INTERFACE: "wg0"
-      TPROXY_PORT: "12345"
-      KERNEL_DNS_BYPASS: "1"
+      REDIRECT_PORT: "12345"
+      DNS_REDIRECT_PORT: "12346"
+      # Reject non-DNS UDP (QUIC/HTTP3) so clients fall back to TCP instantly.
+      REJECT_NON_DNS_UDP: "1"
+      # DNS is proxied through VLESS by default (no leak). Set to "1" to send DNS
+      # directly from the container instead.
+      KERNEL_DNS_BYPASS: "0"
 
       # ---- VLESS side: use either VLESS_URL or split vars ----
       #VLESS_URL: "vless://11111111-2222-3333-4444-555555555555@1.2.3.4:443?type=tcp&security=reality&pbk=abcdefghijklmnopqrstuvwxyz0123456789&fp=chrome&sni=yahoo.com&sid=cee8f80a&spx=%2F&flow=xtls-rprx-vision#client"

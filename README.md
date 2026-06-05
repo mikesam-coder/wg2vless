@@ -44,9 +44,13 @@ Client config is generated at `./data/client.conf` - import it into any WireGuar
 
 ## How it works
 
-WireGuard packets are decrypted by the Linux kernel inside the container. Traffic from the WireGuard interface is then transparently redirected to Xray, which sends it through the configured VLESS outbound.
+WireGuard packets are decrypted by the Linux kernel inside the container. Traffic from the WireGuard interface is then redirected to Xray (`nat REDIRECT`), which sends it through the configured VLESS outbound.
 
-By default, DNS requests from WireGuard clients bypass Xray and leave the container directly (`KERNEL_DNS_BYPASS=1`). This avoids UDP DNS issues with some VLESS servers. Disable it only if your VLESS server reliably supports proxied DNS.
+- **TCP** keeps its original destination via `SO_ORIGINAL_DST` and is proxied through VLESS.
+- **DNS** (port 53) is redirected to a dedicated Xray inbound with a fixed resolver (the first `WG_DNS` entry) and proxied through VLESS, so there is **no DNS leak** and no original-destination problem.
+- **Other UDP** (notably QUIC / HTTP/3 on UDP 443) cannot be transparently proxied with `nat REDIRECT` because the original destination is lost for UDP. By default it is **rejected** (`REJECT_NON_DNS_UDP=1`) so clients fall back to TCP/HTTP2 instantly instead of hanging on timeouts.
+
+> `nat REDIRECT` is used instead of Linux TPROXY because TPROXY does not reliably deliver to the proxy socket inside Docker containers on many kernels. The container needs `NET_ADMIN` and `/dev/net/tun`.
 
 ## Environment
 
@@ -81,9 +85,11 @@ By default, DNS requests from WireGuard clients bypass Xray and leave the contai
 | `WG_ALLOWED_IPS` | `0.0.0.0/0,::/0` | Client-side routed prefixes |
 | `WG_PEER_ALLOWED_IPS` | `10.66.66.2/32` | Server-side peer allowed IPs; add routed LAN subnets here if your router does not NAT tunnel clients |
 | `WG_INTERFACE` | `wg0` | WireGuard interface name inside the container |
-| `TPROXY_PORT` | `12345` | Local transparent redirect port |
-| `TPROXY_EXCLUDE_CIDRS` | `10.0.0.0/8,...` | Comma-separated destinations bypassed by transparent redirect |
-| `KERNEL_DNS_BYPASS` | `1` | Send DNS directly from the container instead of proxying it through VLESS |
+| `REDIRECT_PORT` | `12345` | Local port Xray listens on for redirected TCP |
+| `DNS_REDIRECT_PORT` | `12346` | Local port Xray listens on for redirected DNS |
+| `BYPASS_CIDRS` | `10.0.0.0/8,...` | Comma-separated destinations bypassed by the proxy |
+| `REJECT_NON_DNS_UDP` | `1` | `1` rejects non-DNS UDP (QUIC) so clients fall back to TCP; `0` lets it pass untunnelled |
+| `KERNEL_DNS_BYPASS` | `0` | `1` sends DNS directly from the container (DNS leak) instead of through VLESS |
 
 #### Other
 
